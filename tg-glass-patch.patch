@@ -1,0 +1,229 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/LiteMode.java b/TMessagesProj/src/main/java/org/telegram/messenger/LiteMode.java
+index 37619e6..9aecc8d 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/LiteMode.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/LiteMode.java
+@@ -72,8 +72,9 @@ public class LiteMode {
+         FLAG_AUTOPLAY_VIDEOS |
+         FLAG_AUTOPLAY_GIFS |
+         FLAG_CHAT_THANOS |
+-        FLAG_PARTICLES
+-    ); // 204383
++        FLAG_PARTICLES |
++        FLAG_LIQUID_GLASS
++    ); // 466527
+     public static int PRESET_HIGH = (
+         FLAGS_ANIMATED_STICKERS |
+         FLAGS_ANIMATED_EMOJI |
+@@ -86,8 +87,9 @@ public class LiteMode {
+         FLAG_CALLS_ANIMATIONS |
+         FLAG_AUTOPLAY_VIDEOS |
+         FLAG_AUTOPLAY_GIFS |
+-        FLAG_PARTICLES
+-    ); // 262143
++        FLAG_PARTICLES |
++        FLAG_LIQUID_GLASS
++    ); // 524287
+     public static int PRESET_POWER_SAVER = 0;
+ 
+     private static int BATTERY_LOW = 10;
+@@ -271,7 +273,7 @@ public class LiteMode {
+         if (!preferences.contains("lite_mode6")) {
+             if (preferences.contains("lite_mode5")) {
+                 defaultValue = preferences.getInt("lite_mode5", defaultValue);
+-                defaultValue &=~ FLAG_LIQUID_GLASS;
++                defaultValue |= FLAG_LIQUID_GLASS;
+                 preferences.edit().putInt("lite_mode6", defaultValue).apply();
+             } else if (preferences.contains("lite_mode4")) {
+                 defaultValue = preferences.getInt("lite_mode4", defaultValue);
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+index e6478ee..741cc71 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+@@ -13276,19 +13276,11 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+             return false;
+         }
+ 
+-        final boolean isActionBarTouch = ev.getY() < actionBar.getMeasuredHeight();
+-        if (isActionBarTouch) {
+-            return true;
+-        }
+-
+-        final boolean isFirstTab = filterTabsView == null || filterTabsView.getTabsCount() < 2 || filterTabsView.getCurrentTabId() == filterTabsView.getFirstTabId();
+-        final boolean isLastTab = filterTabsView == null || filterTabsView.getTabsCount() < 2 || filterTabsView.getCurrentTabId() == filterTabsView.getLastTabId();
+-        final int chatSwipeAction = SharedConfig.getChatSwipeAction(currentAccount);
+-        if (forward) {
+-            return isLastTab && !isFirstTab;
+-        } else {
+-            return isFirstTab;
+-        }
++        // liquid glass build: allow dragging between the main tabs from anywhere.
++        // horizontal swipes that belong to a list item are still consumed by the
++        // child view first (ViewPagerFixed#findScrollingChild), so reply/archive
++        // gestures keep working.
++        return true;
+     }
+ 
+     private void showItemOptions() {
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
+index 1dd2ffe..3b25692 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
+@@ -455,6 +455,14 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+         flagSecureReason.attach();
+ 
+         super.onCreate(savedInstanceState);
++        if (Build.VERSION.SDK_INT >= 31) {
++            // liquid glass build: let the system blur whatever sits behind this window
++            try {
++                getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND);
++                getWindow().setBackgroundBlurRadius(AndroidUtilities.dp(28));
++            } catch (Throwable ignore) {
++            }
++        }
+         if (Build.VERSION.SDK_INT >= 24) {
+             AndroidUtilities.isInMultiwindow = isInMultiWindowMode();
+         }
+diff --git a/TMessagesProj/src/main/res/raw/liquid_glass_shader.agsl b/TMessagesProj/src/main/res/raw/liquid_glass_shader.agsl
+index dbcbdf7..648f83d 100644
+--- a/TMessagesProj/src/main/res/raw/liquid_glass_shader.agsl
++++ b/TMessagesProj/src/main/res/raw/liquid_glass_shader.agsl
+@@ -8,6 +8,21 @@ uniform float refract_index;
+ uniform float refract_intensity;
+ uniform float4 foreground_color_premultiplied;
+ 
++// ---------------------------------------------------------------------------
++// Liquid Glass lens (Apple iOS 26 style) for Telegram's blur3 pipeline.
++//
++// Uniform contract matches Telegram 13.2.2 exactly, and the edge handling
++// (sd = min(sdRaw, 0)) is kept from upstream so the downsampled glass keeps
++// refracting past its outline before the outline clips it.
++//
++// Added on top of upstream:
++//   * chromatic dispersion - R/G/B sampled through slightly different IOR
++//   * Fresnel rim light + two directional specular lobes
++//   * thickness shading just inside the rim
++//   * vibrancy boost of the backdrop
++//   * an inline 5-tap softening of the backdrop
++// ---------------------------------------------------------------------------
++
+ half sdfRect(half2 p, half4 r) {
+   r.xy = (p.x > 0.0) ? r.xy : r.zw;
+   r.x  = (p.y > 0.0) ? r.x  : r.y;
+@@ -15,33 +30,77 @@ half sdfRect(half2 p, half4 r) {
+   return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r.x;
+ }
+ 
+-half4 srcOver(half4 src, half4 dst) {
+-    half3 outRGB = (src.rgb + dst.rgb * (1.0 - src.a));
+-    float outA = src.a + (1.0 - src.a) * dst.a;
+-    return half4(outRGB, outA);
+-}
+-
+ half4 main(in float2 fragCoord) {
+   half2 p = fragCoord - center;
+   half sdRaw = sdfRect(p, radius);
+-  half2 uv = fragCoord;
+-  // past the edge the lens goes on as at the edge: the outline clips it, but a downsampled glass is upscaled over it
+   half sd = min(sdRaw, 0.0);
++
++  half thick = max(thickness, 1.0);
++
+   half sdX = sdfRect(p + half2(1.0, 0.0), radius);
+   half sdY = sdfRect(p + half2(0.0, 1.0), radius);
+ 
+-  half n_cos = max(thickness + sd, 0.0) / thickness;
+-  half n_cos2 = n_cos * n_cos;
+-  half n_sin = sqrt(1.0 - n_cos2);
+-  half3 normal = normalize(half3((sdX - sdRaw) * n_cos, (sdY - sdRaw) * n_cos, n_sin));
++  half n_cos = clamp(max(thick + sd, 0.0) / thick, 0.0, 1.0);
++  half n_sin = sqrt(max(1.0 - n_cos * n_cos, 0.0));
++  half2 normal_xy = half2((sdX - sdRaw) * n_cos, (sdY - sdRaw) * n_cos);
++
++  half3 normal = normalize(half3(normal_xy, max(n_sin, 0.0021)));
++  half3 rd = refract(half3(0.0, 0.0, -1.0), normal, 1.0 / max(refract_index, 1.0001));
++  half h = sd < -thick ? thick : sqrt(max(sd * (-2.0 * thick - sd), 0.0));
++  half rlen = (h + 8.0 * thick) / min(rd.z, -0.0001);
++  half2 offset = rd.xy * rlen * refract_intensity;
++
++  // --- backdrop: centre tap + inline 4-tap softening ---
++  half blurPx = clamp(thick * 0.78, 1.0, 26.0);
++  half4 c0 = img.eval(fragCoord + offset);
++  half4 cL = img.eval(fragCoord + offset + half2(blurPx, 0.0));
++  half4 cR = img.eval(fragCoord + offset + half2(-blurPx, 0.0));
++  half4 cT = img.eval(fragCoord + offset + half2(0.0, blurPx));
++  half4 cB = img.eval(fragCoord + offset + half2(0.0, -blurPx));
++  half4 soft = c0 * 0.44 + (cL + cR + cT + cB) * 0.14;
++
++  // --- dispersion: sample R and B through a slightly different IOR ---
++  half dispersion = 0.052 * clamp(length(offset) / max(thick, 1.0), 0.0, 2.2);
++  half4 dRed = img.eval(fragCoord + offset * (1.0 - dispersion));
++  half4 dBlue = img.eval(fragCoord + offset * (1.0 + dispersion));
++
++  half3 refr = half3(dRed.r, soft.g, dBlue.b);
++  half bgA = max(soft.a, max(dRed.a, dBlue.a));
+ 
+-  half3 refract_vec = refract(half3(0.0, 0.0, -1.0), normal, 1.0 / refract_index);
+-  half h = sd < -thickness ? thickness : sqrt(sd * (-2.0 * thickness - sd));
+-  half refract_length = (h + 8.0 * thickness) / -refract_vec.z;
++  // --- vibrancy: lift luminance / saturation a touch ---
++  half lum = dot(refr, half3(0.2126, 0.7152, 0.0722));
++  refr = mix(half3(lum), refr, 1.20);
++  refr *= 1.12;
++  refr += half3(0.015);
+ 
+-  uv += refract_vec.xy * refract_length * refract_intensity;
+-  // on a small shape the edge samples past the far side: stay within the shape, whatever the grid of a downsampled node
+-  uv = clamp(uv, center - size + 0.5, center + size - 0.5);
++  // --- thickness shading: slightly darker just inside the rim ---
++  half inner = smoothstep(0.0, thick * 1.9, -sd);
++  refr *= mix(0.90, 1.0, inner);
+ 
+-  return srcOver(half4(foreground_color_premultiplied), img.eval(uv));
+-}
+\ No newline at end of file
++  // --- rim light ------------------------------------------------------------
++  // n_cos is 1 at the rim (grazing) and 0 a full thickness inside, so Fresnel
++  // has to grow with n_cos.
++  half rimMask = 1.0 - smoothstep(0.0, thick * 0.9, -sd);
++  half fres = pow(n_cos, 3.0);
++
++  half nlen = max(length(normal_xy), 0.0001);
++  half2 n2 = normal_xy / nlen;
++
++  half2 keyLight = normalize(half2(-0.42, -0.92));
++  half spec1 = pow(max(dot(n2, keyLight), 0.0), 6.5);
++
++  half2 fillLight = normalize(half2(0.55, 0.83));
++  half spec2 = pow(max(dot(n2, fillLight), 0.0), 16.0);
++
++  half3 rim = half3(1.0, 0.995, 0.98) * (spec1 * 0.92 + fres * 0.72) * rimMask;
++  rim += half3(0.80, 0.90, 1.0) * spec2 * 0.46 * rimMask;
++
++  half3 col = refr + rim;
++
++  // --- foreground tint (theme aware colour coming from Java) ---
++  half fgA = foreground_color_premultiplied.a;
++  half3 fg = foreground_color_premultiplied.rgb;
++  half3 outCol = fg + col * bgA * (1.0 - fgA);
++
++  return half4(outCol, clamp(fgA + bgA * (1.0 - fgA), 0.0, 1.0));
++}
+diff --git a/gradle.properties b/gradle.properties
+index 17bb1dc..d973433 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -15,12 +15,12 @@
+ #Sat Mar 12 05:53:50 MSK 2016
+ APP_VERSION_CODE=7303
+ APP_VERSION_NAME=13.2.2
+-APP_PACKAGE=org.telegram.messenger
++APP_PACKAGE=com.liquidglass.telegram
+ IS_PRIVATE=false
+ RELEASE_KEY_PASSWORD=android
+ RELEASE_KEY_ALIAS=androidkey
+ RELEASE_STORE_PASSWORD=android
+-org.gradle.jvmargs=-Xmx8g -XX:MaxMetaspaceSize=1g
++org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g
+ org.gradle.daemon=true
+ org.gradle.parallel=true
+ org.gradle.configureondemand=false
